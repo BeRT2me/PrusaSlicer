@@ -295,6 +295,8 @@ public:
     void show_action_buttons(const bool is_ready_to_slice) const;
     void show_action_buttons() const;
     void show_autoslicing_action_buttons() const;
+    void launch_parallel_autoslice();
+    void cancel_parallel_autoslice();
 
     wxString get_project_filename(const wxString& extension = wxEmptyString) const;
     void set_project_filename(const wxString& filename);

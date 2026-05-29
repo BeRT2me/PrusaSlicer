@@ -49,8 +49,8 @@ public:
 		Error
 	};
 
-	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception) :
-		wxEvent(winid, eventType), m_status(status), m_exception(exception) {}
+	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception, int bed_idx = 0) :
+		wxEvent(winid, eventType), m_status(status), m_exception(exception), m_bed_idx(bed_idx) {}
 	virtual wxEvent* Clone() const { return new SlicingProcessCompletedEvent(*this); }
 
 	StatusType 	status()    const { return m_status; }
@@ -58,6 +58,7 @@ public:
 	bool 		success()   const { return m_status == Finished; }
 	bool 		cancelled() const { return m_status == Cancelled; }
 	bool		error() 	const { return m_status == Error; }
+	int         bed_idx()   const { return m_bed_idx; }
 	// Unhandled error produced by stdlib or a Win32 structured exception, or unhandled Slic3r's own critical exception.
 	bool 		critical_error() const;
 	// Critical errors does invalidate plater except CopyFileError.
@@ -71,6 +72,7 @@ public:
 private:
 	StatusType 			m_status;
 	std::exception_ptr 	m_exception;
+	int                 m_bed_idx = 0;
 };
 
 wxDEFINE_EVENT(EVT_SLICING_UPDATE, SlicingStatusEvent);
@@ -93,6 +95,7 @@ public:
     void set_sla_print(SLAPrint *print) { if (m_sla_print != print) stop(); m_sla_print = print; }
 	void set_thumbnail_cb(ThumbnailsGeneratorCallback cb) { m_thumbnail_cb = cb; }
 	void set_gcode_result(GCodeProcessorResult* result) { m_gcode_result = result; }
+	void set_bed_idx(int idx) { m_bed_idx = idx; }
 
 	GCodeProcessorResult *get_gcode_result() { return m_gcode_result; }
 
@@ -290,6 +293,8 @@ private:
 	int 						m_event_finished_id  			= 0;
 	// wxWidgets command ID to be sent to the plater to inform that the G-code is being exported.
 	int                         m_event_export_began_id         = 0;
+	// Bed index this process is slicing; included in completion events so handlers know which bed finished.
+	int                         m_bed_idx                       = 0;
 
 };
 

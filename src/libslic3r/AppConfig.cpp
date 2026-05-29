@@ -66,6 +66,10 @@ void AppConfig::set_defaults()
         // Disable background processing by default as it is not stable.
         if (get("background_processing").empty())
             set("background_processing", "0");
+        // Disable parallel multi-bed slicing by default: it's substantially faster on multi-bed
+        // projects but peak memory scales linearly with bed count (~15 GB for a 4-bed run).
+        if (get("parallel_slice_all").empty())
+            set("parallel_slice_all", "0");
         // Enable support issues alerts by default
         if (get("alert_when_supports_needed").empty())
             set("alert_when_supports_needed", "1");

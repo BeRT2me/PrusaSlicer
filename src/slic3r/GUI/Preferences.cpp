@@ -302,11 +302,19 @@ void PreferencesDialog::build()
 			L("If this is enabled, Slic3r will prompt the last output directory instead of the one containing the input files."),
 			app_config->has("remember_output_path") ? app_config->get_bool("remember_output_path") : true);
 
-		append_bool_option(m_optgroup_general, "background_processing", 
+		append_bool_option(m_optgroup_general, "background_processing",
 			L("Background processing"),
 			L("If this is enabled, Slic3r will pre-process objects as soon "
 				"as they\'re loaded in order to save time when exporting G-code."),
 			app_config->get_bool("background_processing"));
+
+		append_bool_option(m_optgroup_general, "parallel_slice_all",
+			L("Slice all beds in parallel"),
+			L("Slices every bed concurrently instead of one at a time. Substantially faster on "
+				"multi-bed projects (~3x on 4 beds with a multi-core CPU), at the cost of moderately "
+				"higher peak memory (~25-30% more than sequential, depending on bed count and model "
+				"complexity)."),
+			app_config->get_bool("parallel_slice_all"));
 
 		append_bool_option(m_optgroup_general, "alert_when_supports_needed", 
 			L("Alert when supports needed"),
