@@ -152,6 +152,7 @@ void GLCanvas3D::select_bed(int i, bool triggered_by_user)
         wxGetApp().plater()->schedule_background_process();
         wxGetApp().plater()->object_list_changed(); // Updates Slice Now / Export buttons.
         if (s_multiple_beds.is_autoslicing() && triggered_by_user) {
+            wxGetApp().plater()->cancel_parallel_autoslice(); // must drain threads before clearing flag
             s_multiple_beds.stop_autoslice(false);
             wxGetApp().sidebar().switch_from_autoslicing_mode();
         }
@@ -2214,11 +2215,16 @@ void GLCanvas3D::render()
 
         if (!all_finished) {
             render_autoslicing_wait();
-            if (fff_print()->finished() || !is_sliceable(s_print_statuses[s_multiple_beds.get_active_bed()])) {
-                s_multiple_beds.autoslice_next_bed();
-                wxYield();
-            } else {
-                wxGetApp().plater()->schedule_background_process();
+            // Sequential mode: drive bed-by-bed advancement from the render loop.
+            // In parallel mode (parallel_slice_all=true), launch_parallel_autoslice() already
+            // started every bed's worker thread, so the render loop just waits passively.
+            if (!wxGetApp().app_config->get_bool("parallel_slice_all")) {
+                if (fff_print()->finished() || !is_sliceable(s_print_statuses[s_multiple_beds.get_active_bed()])) {
+                    s_multiple_beds.autoslice_next_bed();
+                    wxYield();
+                } else {
+                    wxGetApp().plater()->schedule_background_process();
+                }
             }
         } else {
             wxGetApp().plater()->show_autoslicing_action_buttons();
@@ -6672,6 +6678,8 @@ void Slic3r::GUI::GLCanvas3D::_render_bed_selector()
                 s_multiple_beds.start_autoslice([this](int i, bool user) { this->select_bed(i, user); });
                 wxGetApp().sidebar().switch_to_autoslicing_mode();
                 wxGetApp().plater()->show_autoslicing_action_buttons();
+                if (wxGetApp().app_config->get_bool("parallel_slice_all"))
+                    wxGetApp().plater()->launch_parallel_autoslice();
             }
         }
 
