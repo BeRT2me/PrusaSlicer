@@ -352,6 +352,14 @@ struct Plater::priv
     ProjectDirtyStateManager dirty_state;
      
     BackgroundSlicingProcess    background_process;
+    // One process per bed, indexed by bed_idx. Pre-flight invalid beds have a nullptr slot.
+    // Previously-finished beds keep their process alive across runs so their temp gcode persists
+    // for "Export All" (the process's destructor deletes its own temp file).
+    std::vector<std::unique_ptr<BackgroundSlicingProcess>> m_autoslice_processes;
+    // Bed indices the current/most-recent parallel run is actually slicing. Beds that were kept
+    // from a previous run (already finished, not re-slicing this turn) are NOT in this list, so
+    // they don't contribute to progress accounting or trigger the final UI refresh.
+    std::vector<int> m_current_run_beds;
     bool suppressed_backround_processing_update { false };
 
     // TODO: A mechanism would be useful for blocking the plater interactions:
@@ -601,6 +609,15 @@ struct Plater::priv
 
     void show_action_buttons(const bool is_ready_to_slice) const;
     void show_autoslicing_action_buttons() const;
+    void launch_parallel_autoslice();
+    // True iff a parallel-mode "Slice all" run is currently owning the slicing pipeline (either
+    // actively slicing, or showing the post-completion statistics overlay before the user exits
+    // autoslice mode). Used as the predicate for several guards that must suppress the single
+    // background_process / single-bed UI updates only while parallel mode is in charge.
+    bool is_parallel_autoslicing() const {
+        return s_multiple_beds.is_autoslicing()
+            && wxGetApp().app_config->get_bool("parallel_slice_all");
+    }
     bool can_show_upload_to_connect() const;
     // Set the bed shape to a single closed 2D polygon(array of two element arrays),
     // triangulate the bed and store the triangles into m_bed.m_triangles,
@@ -738,6 +755,7 @@ void Plater::priv::init()
     background_process.set_fff_print(fff_prints.front().get());
     background_process.set_sla_print(sla_prints.front().get());
     background_process.set_gcode_result(&gcode_results.front());
+    background_process.set_bed_idx(-1); // sentinel: events from the single process route to the single-bed handler, never the parallel branch
     background_process.set_thumbnail_cb([this](const ThumbnailsParams& params) { return this->generate_thumbnails(params, Camera::EType::Ortho); });
     background_process.set_slicing_completed_event(EVT_SLICING_COMPLETED);
     background_process.set_finished_event(EVT_PROCESS_COMPLETED);
@@ -2418,6 +2436,9 @@ void Plater::priv::regenerate_thumbnails(SimpleEvent&) {
 // Returns a bitmask of UpdateBackgroundProcessReturnState.
 unsigned int Plater::priv::update_background_process(bool force_validation, bool postpone_error_messages)
 {
+    if (is_parallel_autoslicing())
+        return 0; // parallel processes manage themselves; the single background_process stays out of the way
+
 //    assert(! s_beds_just_switched || background_process.idle());
 
     int active_bed = s_multiple_beds.get_active_bed();
@@ -2619,7 +2640,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         (return_state & UPDATE_BACKGROUND_PROCESS_RESTART) == 0) {
         // The background processing was killed and it will not be restarted.
         // Post the "canceled" callback message, so that it will be processed after any possible pending status bar update messages.
-        wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new SlicingProcessCompletedEvent(EVT_PROCESS_COMPLETED, 0, SlicingProcessCompletedEvent::Cancelled, std::exception_ptr{}));
+        wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new SlicingProcessCompletedEvent(EVT_PROCESS_COMPLETED, 0, SlicingProcessCompletedEvent::Cancelled, std::exception_ptr{}, -1));
     }
 
     if ((return_state & UPDATE_BACKGROUND_PROCESS_INVALID) != 0)
@@ -3228,7 +3249,9 @@ void Plater::priv::set_current_panel(wxPanel* panel)
 
     if (current_panel == view3D) {
 
-        if(s_multiple_beds.stop_autoslice(true)) {
+        if(s_multiple_beds.is_autoslicing()) {
+            q->cancel_parallel_autoslice(); // must drain threads before clearing flag
+            s_multiple_beds.stop_autoslice(true);
             sidebar->switch_from_autoslicing_mode();
             update_background_process();
         }
@@ -3295,6 +3318,11 @@ void Plater::priv::set_current_panel(wxPanel* panel)
 
 void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 {
+    // Suppress per-step progress only during PARALLEL autoslicing — many concurrent threads would
+    // otherwise overwrite each other's progress text. Sequential autoslicing keeps the normal flow.
+    if (is_parallel_autoslicing())
+        return;
+
     if (evt.status.percent >= -1) {
         if (!m_worker.is_idle()) {
             // Avoid a race condition
@@ -3427,6 +3455,11 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 
 void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
 {
+    // Skip per-bed scene refresh only during PARALLEL autoslicing (the autoslice overlay hides
+    // the scene anyway; final refresh fires from on_process_completed when all beds finish).
+    // Sequential autoslicing keeps the normal per-bed refresh.
+    if (is_parallel_autoslicing())
+        return;
     if (view3D->is_dragging()) // updating scene now would interfere with the gizmo dragging
         delayed_scene_refresh = true;
     else {
@@ -3511,6 +3544,68 @@ bool Plater::priv::warnings_dialog()
 }
 void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 {
+    // launch_parallel_autoslice() calls background_process.stop() up front, which (if the single
+    // process was running) posts a Cancelled event with bed_idx == -1. Routing it into the
+    // single-bed handler would set s_print_statuses[get_active_bed()] = idle — visibly canceling
+    // whichever bed the user happened to be on, even though its parallel process is slicing fine.
+    // Discard such stale single-process events while parallel autoslicing owns the slicing.
+    if (evt.bed_idx() < 0 && is_parallel_autoslicing())
+        return;
+
+    // Events from a parallel autoslice process carry a bed index >= 0. The single
+    // background_process uses the sentinel -1 and falls through to the single-bed handler below.
+    if (evt.bed_idx() >= 0) {
+        const int bed_idx = evt.bed_idx();
+        // A stale event whose process has already been torn down (cancel/relaunch), or an event
+        // whose slot was never populated (pre-flight invalid bed). Ignore either case so we
+        // neither leak into the single-bed handler nor deref a null slot.
+        if (bed_idx >= (int)m_autoslice_processes.size() || !m_autoslice_processes[bed_idx])
+            return;
+
+        m_autoslice_processes[bed_idx]->stop();
+        m_autoslice_processes[bed_idx]->reset_export();
+
+        if (evt.error()) {
+            s_print_statuses[bed_idx] = PrintStatus::invalid;
+            // Surface the failure — otherwise the bed fails silently while the bar still completes.
+            std::pair<std::string, bool> message = evt.format_error_message();
+            notification_manager->push_slicing_error_notification(
+                GUI::format(_L("Bed %1%: %2%"), bed_idx + 1, message.first));
+        }
+        else if (evt.cancelled())
+            s_print_statuses[bed_idx] = PrintStatus::idle;
+        else
+            s_print_statuses[bed_idx] = PrintStatus::finished;
+
+        // Progress reflects only beds being sliced this run. Pre-flight invalid beds and beds
+        // kept from a previous run (already finished — no work this turn) don't contribute.
+        const int total_attempted = (int)m_current_run_beds.size();
+        int done = 0;
+        for (int idx : m_current_run_beds)
+            if (s_print_statuses[idx] != PrintStatus::running)
+                ++done;
+        notification_manager->set_slicing_progress_percentage(
+            GUI::format(_L("%1% / %2% beds sliced"), done, total_attempted),
+            total_attempted > 0 ? (float)done / (float)total_attempted : 1.f);
+
+        if (done == total_attempted) {
+            // All beds finished — refresh scene, sidebar stats, and button states once.
+            this->sidebar->show_sliced_info_sizer(true);
+            this->object_list_changed();
+            if (view3D->is_dragging())
+                delayed_scene_refresh = true;
+            else
+                this->update_fff_scene();
+            // NOTE: m_autoslice_processes is intentionally NOT cleared here. Export All
+            // (export_all_gcodes) reads each bed's temp gcode via finalize_gcode, and a
+            // process's destructor deletes its own temp file — so the processes must outlive
+            // completion. The (bounded, <= MAX_NUMBER_OF_BEDS) set of idle processes is cleared
+            // on the next launch_parallel_autoslice() or by cancel_parallel_autoslice() when the
+            // user leaves autoslicing mode.
+        }
+        return;
+    }
+
     // Stop the background task, wait until the thread goes into the "Idle" state.
     // At this point of time the thread should be either finished or canceled,
     // so the following call just confirms, that the produced data were consumed.
@@ -4212,6 +4307,99 @@ void Plater::priv::show_autoslicing_action_buttons() const {
     }
 
     sidebar->enable_bulk_buttons(all_finished);
+}
+
+void Plater::priv::launch_parallel_autoslice()
+{
+    background_process.stop();
+
+    const int n_beds = s_multiple_beds.get_number_of_beds();
+    // Don't clear m_autoslice_processes wholesale — we want to PRESERVE processes (and their
+    // temp gcode files) for beds that were already sliced and don't need re-doing. The vector is
+    // grown to n_beds if more beds exist now; existing slots are preserved.
+    m_autoslice_processes.resize(n_beds);
+    m_current_run_beds.clear();
+
+    DynamicPrintConfig full_config = wxGetApp().preset_bundle->full_config();
+    if (full_config.has("binary_gcode"))
+        full_config.set("binary_gcode", bool(full_config.opt_bool("binary_gcode") & wxGetApp().app_config->get_bool("use_binary_gcode_when_supported")));
+    const Preset& selected_printer = wxGetApp().preset_bundle->printers.get_selected_preset();
+    std::string printer_model = selected_printer.config.opt_string("printer_model");
+    const PresetWithVendorProfile& printer_with_vendor = wxGetApp().preset_bundle->printers.get_preset_with_vendor_profile(selected_printer);
+    printer_model = selected_printer.trim_vendor_repo_prefix(printer_model, printer_with_vendor.vendor);
+    full_config.set("printer_model", printer_model);
+    if (selected_printer.vendor) {
+        full_config.set("profile_vendor", selected_printer.vendor->name, true);
+        full_config.set("profile_version", selected_printer.vendor->config_version.to_string(), true);
+    }
+
+    // Phase 1: for each bed, decide what to do.
+    //   - Pre-flight invalid: drop any existing process (no longer usable; temp file going with it is fine).
+    //   - Already sliced (Print::finished() and we still have a process): keep as-is. Don't re-slice,
+    //     don't touch the temp gcode file (Export All will use it).
+    //   - Otherwise (new bed, or model/config changed so Print is no longer finished): create a fresh
+    //     process for it and queue it for slicing this run. Old process (if any) gets destroyed,
+    //     which deletes its now-stale temp gcode — fine, the new run replaces it.
+    // (with_single_bed_model_fff mutates the shared Model — must not run concurrently)
+    for (int i = 0; i < n_beds; ++i) {
+        if (!is_sliceable(s_print_statuses[i])) {
+            m_autoslice_processes[i].reset();
+            continue;
+        }
+        if (m_autoslice_processes[i] && fff_prints[i]->finished())
+            continue; // already sliced — keep existing process and its temp gcode, no work this run
+
+        auto proc = std::make_unique<BackgroundSlicingProcess>();
+        proc->set_bed_idx(i);
+        proc->set_fff_print(fff_prints[i].get());
+        proc->set_gcode_result(&gcode_results[i]);
+        proc->set_temp_output_path(i);
+        proc->set_thumbnail_cb([this](const ThumbnailsParams& params) {
+            return generate_thumbnails(params, Camera::EType::Ortho);
+        });
+        proc->set_slicing_completed_event(EVT_SLICING_COMPLETED);
+        proc->set_finished_event(EVT_PROCESS_COMPLETED);
+        proc->set_export_began_event(EVT_EXPORT_BEGAN);
+        proc->select_technology(printer_technology);
+
+        using MultipleBedsUtils::with_single_bed_model_fff;
+        with_single_bed_model_fff(q->model(), i, [&]() {
+            proc->apply(q->model(), full_config);
+        });
+
+        m_autoslice_processes[i] = std::move(proc);
+        m_current_run_beds.push_back(i);
+    }
+
+    clear_warnings();
+    notification_manager->close_notification_of_type(NotificationType::SignDetected);
+    notification_manager->close_notification_of_type(NotificationType::ExportFinished);
+    for (int idx : m_current_run_beds)
+        s_print_statuses[idx] = PrintStatus::running;
+
+    // Edge case: nothing to slice this run (everything was either invalid or already sliced).
+    // Don't start a progress notification we'll never update — go straight to the completion UI.
+    if (m_current_run_beds.empty()) {
+        notification_manager->set_slicing_progress_hidden();
+        this->sidebar->show_sliced_info_sizer(true);
+        this->object_list_changed();
+        if (view3D->is_dragging())
+            delayed_scene_refresh = true;
+        else
+            this->update_fff_scene();
+        return;
+    }
+
+    // Initialize the progress bar. Only beds being sliced this run contribute. Pre-flight invalid
+    // beds and beds kept from a previous run (already sliced) are NOT in the numerator or
+    // denominator — the bar reflects only the work we're actually doing this turn.
+    notification_manager->set_slicing_progress_began();
+    notification_manager->set_slicing_progress_percentage(
+        GUI::format(_L("0 / %1% beds sliced"), m_current_run_beds.size()), 0.f);
+
+    // Phase 2: start only the beds being sliced this run.
+    for (int idx : m_current_run_beds)
+        m_autoslice_processes[idx]->start();
 }
 
 void Plater::priv::enter_gizmos_stack()
@@ -7555,6 +7743,22 @@ void Plater::show_action_buttons(const bool ready_to_slice) const   { p->show_ac
 void Plater::show_action_buttons() const                            { p->show_action_buttons(p->ready_to_slice); }
 
 void Plater::show_autoslicing_action_buttons() const { p->show_autoslicing_action_buttons(); };
+void Plater::launch_parallel_autoslice() { p->launch_parallel_autoslice(); }
+void Plater::cancel_parallel_autoslice()
+{
+    // Stop every process from this run. Then DROP only the ones whose work was incomplete —
+    // i.e. whose Print is not finished. Successfully-completed beds keep their process (and
+    // therefore their valid temp gcode file), so a subsequent Slice all can skip re-slicing
+    // them and Export all can still produce gcode for those beds.
+    for (int idx : p->m_current_run_beds) {
+        if (idx >= 0 && idx < (int)p->m_autoslice_processes.size() && p->m_autoslice_processes[idx]) {
+            p->m_autoslice_processes[idx]->stop();
+            if (!p->fff_prints[idx]->finished())
+                p->m_autoslice_processes[idx].reset();
+        }
+    }
+    p->m_current_run_beds.clear();
+}
 
 void Plater::copy_selection_to_clipboard()
 {

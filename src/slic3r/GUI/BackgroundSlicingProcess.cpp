@@ -109,23 +109,40 @@ void BackgroundSlicingProcess::set_temp_output_path(int bed_idx)
 	m_temp_output_path = temp_path.string();
 }
 
-BackgroundSlicingProcess::~BackgroundSlicingProcess() 
-{ 
+BackgroundSlicingProcess::~BackgroundSlicingProcess()
+{
 	this->stop();
 	this->join_background_thread();
 
-	// Current m_temp_output_path corresponds to the last selected bed. Remove everything
-	// in the same directory that starts the same (see set_temp_output_path).
-	const auto temp_dir = boost::filesystem::path(m_temp_output_path).parent_path();
-	std::string prefix = boost::filesystem::path(m_temp_output_path).filename().string();
-	prefix = prefix.substr(0, prefix.find('_'));
-    for (const auto& entry : boost::filesystem::directory_iterator(temp_dir)) {
-        if (entry.is_regular_file()) {
-            const std::string filename = entry.path().filename().string();
-            if (boost::starts_with(filename, prefix) && boost::ends_with(filename, ".gcode"))
-                boost::filesystem::remove(entry);
-        }
-    }
+	if (m_temp_output_path.empty())
+		return;
+
+	// Use non-throwing filesystem calls and a catch-all: this runs from a destructor (including
+	// during std::vector::clear() of the parallel autoslice processes), and an escaping exception
+	// would call std::terminate. On Windows a temp file may be locked (open in the preview/export).
+	try {
+		boost::system::error_code ec;
+		if (m_bed_idx < 0) {
+			// The shared single-bed process may have produced one temp file per bed it sliced over
+			// its lifetime. Clean all of them up at shutdown (see set_temp_output_path).
+			const auto temp_dir = boost::filesystem::path(m_temp_output_path).parent_path();
+			std::string prefix = boost::filesystem::path(m_temp_output_path).filename().string();
+			prefix = prefix.substr(0, prefix.find('_'));
+			for (boost::filesystem::directory_iterator it(temp_dir, ec), end; !ec && it != end; it.increment(ec)) {
+				const auto& entry = *it;
+				if (boost::filesystem::is_regular_file(entry.path(), ec)) {
+					const std::string filename = entry.path().filename().string();
+					if (boost::starts_with(filename, prefix) && boost::ends_with(filename, ".gcode"))
+						boost::filesystem::remove(entry.path(), ec);
+				}
+			}
+		} else {
+			// A parallel autoslice process owns exactly one bed's temp file. Remove only that file,
+			// so destroying one process never deletes another bed's gcode or an in-progress export's.
+			boost::filesystem::remove(boost::filesystem::path(m_temp_output_path), ec);
+		}
+	} catch (...) {
+	}
 }
 
 bool BackgroundSlicingProcess::select_technology(PrinterTechnology tech)
@@ -265,9 +282,9 @@ void BackgroundSlicingProcess::thread_proc()
 		if (m_print->cancel_status() != Print::CANCELED_INTERNAL) {
 			// Only post the canceled event, if canceled by user.
 			// Don't post the canceled event, if canceled from Print::apply().
-			SlicingProcessCompletedEvent evt(m_event_finished_id, 0, 
+			SlicingProcessCompletedEvent evt(m_event_finished_id, 0,
 				(m_state == STATE_CANCELED) ? SlicingProcessCompletedEvent::Cancelled :
-				exception ? SlicingProcessCompletedEvent::Error : SlicingProcessCompletedEvent::Finished, exception);
+				exception ? SlicingProcessCompletedEvent::Error : SlicingProcessCompletedEvent::Finished, exception, m_bed_idx);
         	wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
         	// Cancelled by the user, not internally, thus cleanup() was not called yet.
         	// Otherwise cleanup() is called from Print::apply()
