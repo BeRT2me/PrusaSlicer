@@ -152,9 +152,7 @@ void GLCanvas3D::select_bed(int i, bool triggered_by_user)
         wxGetApp().plater()->schedule_background_process();
         wxGetApp().plater()->object_list_changed(); // Updates Slice Now / Export buttons.
         if (s_multiple_beds.is_autoslicing() && triggered_by_user) {
-            wxGetApp().plater()->cancel_parallel_autoslice(); // must drain threads before clearing flag
-            s_multiple_beds.stop_autoslice(false);
-            wxGetApp().sidebar().switch_from_autoslicing_mode();
+            wxGetApp().plater()->leave_autoslice_mode(false);
         }
     });
 }
@@ -2216,9 +2214,13 @@ void GLCanvas3D::render()
         if (!all_finished) {
             render_autoslicing_wait();
             // Sequential mode: drive bed-by-bed advancement from the render loop.
-            // In parallel mode (parallel_slice_all=true), launch_parallel_autoslice() already
-            // started every bed's worker thread, so the render loop just waits passively.
-            if (!wxGetApp().app_config->get_bool("parallel_slice_all")) {
+            // In parallel mode, launch_parallel_autoslice() already started every bed's worker
+            // thread, so the render loop just waits passively. We consult the FROZEN flag
+            // (Plater::is_parallel_autoslicing) rather than the live preference — toggling the
+            // checkbox mid-run must not flip the render loop into the sequential branch and
+            // start driving the shared background_process against fff_prints[active_bed] while
+            // the per-bed worker is still slicing the same Print.
+            if (!wxGetApp().plater()->is_parallel_autoslicing()) {
                 if (fff_print()->finished() || !is_sliceable(s_print_statuses[s_multiple_beds.get_active_bed()])) {
                     s_multiple_beds.autoslice_next_bed();
                     wxYield();

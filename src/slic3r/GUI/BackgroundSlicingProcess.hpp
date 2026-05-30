@@ -49,7 +49,10 @@ public:
 		Error
 	};
 
-	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception, int bed_idx = 0) :
+	// bed_idx default is -1 (the single-process sentinel), not 0 (a valid parallel bed index).
+	// Any caller that omits the argument routes through the single-bed handler rather than
+	// silently stomping bed 0's state via the parallel branch in on_process_completed.
+	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception, int bed_idx = -1) :
 		wxEvent(winid, eventType), m_status(status), m_exception(exception), m_bed_idx(bed_idx) {}
 	virtual wxEvent* Clone() const { return new SlicingProcessCompletedEvent(*this); }
 
@@ -294,7 +297,10 @@ private:
 	// wxWidgets command ID to be sent to the plater to inform that the G-code is being exported.
 	int                         m_event_export_began_id         = 0;
 	// Bed index this process is slicing; included in completion events so handlers know which bed finished.
-	int                         m_bed_idx                       = 0;
+	// Default -1 matches the single-process sentinel: a default-constructed instance whose
+	// set_bed_idx() was never reached behaves like the shared process (prefix-sweep cleanup,
+	// route completion events through the single-bed handler) rather than falsely tagging bed 0.
+	int                         m_bed_idx                       = -1;
 
 };
 
