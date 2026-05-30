@@ -297,6 +297,14 @@ public:
     void show_autoslicing_action_buttons() const;
     void launch_parallel_autoslice();
     void cancel_parallel_autoslice();
+    // Single API for "exit autoslicing mode": drains any parallel workers, clears the autoslice
+    // flag on s_multiple_beds, and flips the sidebar back. Every callsite that wants to leave
+    // autoslicing must go through this — order matters (drain threads before clearing flag).
+    void leave_autoslice_mode(bool user_initiated);
+    // True iff a parallel-mode "Slice all" run is actively in charge of the slicing pipeline.
+    // Frozen at launch_parallel_autoslice() time so a Preferences toggle mid-run cannot flip
+    // routing between the parallel and single-bed code paths.
+    bool is_parallel_autoslicing() const;
 
     wxString get_project_filename(const wxString& extension = wxEmptyString) const;
     void set_project_filename(const wxString& filename);

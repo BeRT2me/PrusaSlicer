@@ -614,10 +614,25 @@ struct Plater::priv
     // actively slicing, or showing the post-completion statistics overlay before the user exits
     // autoslice mode). Used as the predicate for several guards that must suppress the single
     // background_process / single-bed UI updates only while parallel mode is in charge.
+    //
+    // The mode is FROZEN at launch_parallel_autoslice() time — toggling the Preferences checkbox
+    // mid-run does not flip the predicate. Otherwise the render loop and update_background_process
+    // would start driving the shared background_process against fff_prints[active_bed] while the
+    // per-bed parallel worker is still slicing the same Print.
     bool is_parallel_autoslicing() const {
-        return s_multiple_beds.is_autoslicing()
-            && wxGetApp().app_config->get_bool("parallel_slice_all");
+        return s_multiple_beds.is_autoslicing() && m_parallel_autoslice_active;
     }
+    bool m_parallel_autoslice_active = false;
+    // Per-run outcome counters used by the parallel completion branch to decide which end-of-run
+    // notifications to fire. s_print_statuses can't distinguish "cancelled this run" from "never
+    // slicedthis run" (both end up as PrintStatus::idle), so we count here instead. Reset at the
+    // start of each parallel run in launch_parallel_autoslice().
+    int  m_parallel_run_cancel_count = 0;
+    int  m_parallel_run_error_count  = 0;
+    // Template-filament warning is preset-based, not bed-based — every bed's worker emits a
+    // percent>=100 SlicingStatusEvent that would push the same warning. Latch on first emission
+    // per parallel run so the warning surfaces once, not N times.
+    bool m_parallel_run_template_warning_pushed = false;
     bool can_show_upload_to_connect() const;
     // Set the bed shape to a single closed 2D polygon(array of two element arrays),
     // triangulate the bed and store the triangles into m_bed.m_triangles,
@@ -2199,6 +2214,12 @@ void Plater::priv::reset()
 
     m_worker.cancel_all();
 
+    // Drain any parallel autoslice workers BEFORE clearing the shared Model. Without this,
+    // model.clear_objects() below pulls the rug out from under per-bed worker threads still
+    // reading ModelObject* via fff_prints[i] → use-after-free.
+    if (s_multiple_beds.is_autoslicing())
+        q->leave_autoslice_mode(false);
+
     // Stop and reset the Print content.
     this->background_process.reset();
     model.clear_objects();
@@ -3250,9 +3271,7 @@ void Plater::priv::set_current_panel(wxPanel* panel)
     if (current_panel == view3D) {
 
         if(s_multiple_beds.is_autoslicing()) {
-            q->cancel_parallel_autoslice(); // must drain threads before clearing flag
-            s_multiple_beds.stop_autoslice(true);
-            sidebar->switch_from_autoslicing_mode();
+            q->leave_autoslice_mode(true);
             update_background_process();
         }
 
@@ -3280,6 +3299,18 @@ void Plater::priv::set_current_panel(wxPanel* panel)
             notification_manager->set_in_preview(false);
     }
     else if (current_panel == preview) {
+        // In PARALLEL autoslice mode only: drain workers BEFORE the preview branch below reads
+        // gcode_results[active_bed] via init_gcode_viewer / load_gcode_shells / reload_print —
+        // otherwise those reads race the per-bed worker writing the same GCodeProcessorResult.
+        //
+        // Do NOT cancel in sequential autoslice mode: when the user is on the Preview tab,
+        // select_bed's CallAfter auto-posts EVT_GLVIEWTOOLBAR_PREVIEW between beds so the preview
+        // updates as each bed finishes. Canceling here would exit autoslice mid-run after the
+        // first bed, generate a "Slicing Cancelled" popup, and leave subsequent beds unsliced.
+        // Sequential mode is safe because only one bg process writes gcode_results at a time.
+        if (is_parallel_autoslicing())
+            q->leave_autoslice_mode(true);
+
         if (old_panel == view3D)
             view3D->get_canvas3d()->unbind_event_handlers();
 
@@ -3318,12 +3349,22 @@ void Plater::priv::set_current_panel(wxPanel* panel)
 
 void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 {
-    // Suppress per-step progress only during PARALLEL autoslicing — many concurrent threads would
-    // otherwise overwrite each other's progress text. Sequential autoslicing keeps the normal flow.
-    if (is_parallel_autoslicing())
-        return;
+    // In PARALLEL autoslicing, multiple per-bed worker threads concurrently fire status updates
+    // into this single handler. We suppress only the pieces that don't make sense per-bed:
+    //   * progress-percent overwrite — clobbers the "N/M beds sliced" counter the parallel
+    //     completion branch maintains.
+    //   * RELOAD_SCENE / RELOAD_SLA_PREVIEW — the autoslice overlay hides the scene anyway, and
+    //     the parallel completion branch refreshes once when all beds finish.
+    //   * Per-step warning processing — queries q->active_fff_print(), which returns the active
+    //     bed's Print regardless of which bed actually emitted the event. Wrong-bed warnings
+    //     would race with the active bed's worker. Requires SlicingStatusEvent to carry a
+    //     bed_idx before we can route these correctly per-bed; left as a TODO.
+    // Template-filament warning DOES surface: it's preset-based (not bed-specific) and would be
+    // a real loss-of-protection if dropped. Latched via m_parallel_run_template_warning_pushed
+    // so it fires once per run, not once per bed.
+    const bool parallel = is_parallel_autoslicing();
 
-    if (evt.status.percent >= -1) {
+    if (!parallel && evt.status.percent >= -1) {
         if (!m_worker.is_idle()) {
             // Avoid a race condition
             return;
@@ -3333,7 +3374,10 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 
     // Check template filaments and add warning
     // This is more convinient to do here than in slicing backend, so it happens on "Slicing complete".
-    if (evt.status.percent >= 100 && this->printer_technology == ptFFF) {
+    if (evt.status.percent >= 100 && this->printer_technology == ptFFF
+        && (!parallel || !m_parallel_run_template_warning_pushed)) {
+        if (parallel)
+            m_parallel_run_template_warning_pushed = true;
         size_t templ_cnt = 0;
         const auto& preset_bundle = wxGetApp().preset_bundle;
         std::string names;
@@ -3363,6 +3407,13 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
             add_warning({ PrintStateBase::WarningLevel::CRITICAL, true, message_dial, 0}, 0);
         }
     }
+
+    // In parallel mode, everything below queries q->active_fff_print() (the currently-active bed)
+    // regardless of which bed the event came from, so the scene-reload and per-step-warning routing
+    // is wrong-bed by construction. Bail out before we wander into races on the active bed's Print.
+    // TODO: thread bed_idx through SlicingStatusEvent and route per-bed warnings correctly.
+    if (parallel)
+        return;
 
     if (evt.status.flags & (PrintBase::SlicingStatus::RELOAD_SCENE | PrintBase::SlicingStatus::RELOAD_SLA_SUPPORT_POINTS)) {
         switch (this->printer_technology) {
@@ -3567,13 +3618,34 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 
         if (evt.error()) {
             s_print_statuses[bed_idx] = PrintStatus::invalid;
+            ++m_parallel_run_error_count;
             // Surface the failure — otherwise the bed fails silently while the bar still completes.
             std::pair<std::string, bool> message = evt.format_error_message();
-            notification_manager->push_slicing_error_notification(
-                GUI::format(_L("Bed %1%: %2%"), bed_idx + 1, message.first));
+            const std::string bed_message = GUI::format(_L("Bed %1%: %2%"), bed_idx + 1, message.first);
+            if (evt.critical_error()) {
+                // Hard failure: same modal treatment the single-bed handler gives, with the
+                // m_tracking_popup_menu postponement so we don't pop a dialog under an open menu.
+                if (q->m_tracking_popup_menu) {
+                    if (!q->m_tracking_popup_menu_error_message.empty())
+                        q->m_tracking_popup_menu_error_message += "\n\n";
+                    q->m_tracking_popup_menu_error_message += bed_message;
+                } else {
+                    show_error(q, bed_message, message.second);
+                }
+            } else {
+                notification_manager->push_slicing_error_notification(bed_message);
+            }
+            if (evt.invalidate_plater()) {
+                // Match the single-bed handler: invalid project ⇒ action buttons relabeled.
+                const wxString invalid_str = _L("Invalid data");
+                for (auto btn : { ActionButtonType::Reslice, ActionButtonType::SendGCode, ActionButtonType::Export })
+                    sidebar->set_btn_label(btn, invalid_str);
+            }
         }
-        else if (evt.cancelled())
+        else if (evt.cancelled()) {
             s_print_statuses[bed_idx] = PrintStatus::idle;
+            ++m_parallel_run_cancel_count;
+        }
         else
             s_print_statuses[bed_idx] = PrintStatus::finished;
 
@@ -3584,6 +3656,9 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         for (int idx : m_current_run_beds)
             if (s_print_statuses[idx] != PrintStatus::running)
                 ++done;
+        const bool any_error  = m_parallel_run_error_count  > 0;
+        const bool any_cancel = m_parallel_run_cancel_count > 0;
+        const bool all_success = (done == total_attempted) && !any_error && !any_cancel;
         notification_manager->set_slicing_progress_percentage(
             GUI::format(_L("%1% / %2% beds sliced"), done, total_attempted),
             total_attempted > 0 ? (float)done / (float)total_attempted : 1.f);
@@ -3596,6 +3671,29 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
                 delayed_scene_refresh = true;
             else
                 this->update_fff_scene();
+
+            // Match the single-bed handler's end-of-slice notifications and export-flow signaling.
+            // - export_possible: re-enables Export buttons that were dimmed during the run.
+            // - canceled notification: shows "Slicing Cancelled." if the user aborted any bed.
+            // - exporting_status + removable_drive_manager: completes the schedule-export-then-slice
+            //   flow. Without these, a "Slice all → Export to USB" sequence leaves the eject button
+            //   missing and ExportOngoing notifications leaked.
+            if (all_success)
+                notification_manager->set_slicing_progress_export_possible();
+            if (any_cancel)
+                notification_manager->set_slicing_progress_canceled(_u8L("Slicing Cancelled."));
+            if (exporting_status != ExportingStatus::NOT_EXPORTING && !any_error) {
+                notification_manager->stop_delayed_notifications_of_type(NotificationType::ExportOngoing);
+                notification_manager->close_notification_of_type(NotificationType::ExportOngoing);
+            }
+            if (exporting_status == ExportingStatus::EXPORTING_TO_REMOVABLE && !any_error) {
+                notification_manager->push_exporting_finished_notification(last_output_path, last_output_dir_path,
+                    platform_flavor() != PlatformFlavor::LinuxOnChromium);
+                wxGetApp().removable_drive_manager()->set_exporting_finished(true);
+            } else if (exporting_status == ExportingStatus::EXPORTING_TO_LOCAL && !any_error) {
+                notification_manager->push_exporting_finished_notification(last_output_path, last_output_dir_path, false);
+            }
+            exporting_status = ExportingStatus::NOT_EXPORTING;
             // NOTE: m_autoslice_processes is intentionally NOT cleared here. Export All
             // (export_all_gcodes) reads each bed's temp gcode via finalize_gcode, and a
             // process's destructor deletes its own temp file — so the processes must outlive
@@ -4311,7 +4409,21 @@ void Plater::priv::show_autoslicing_action_buttons() const {
 
 void Plater::priv::launch_parallel_autoslice()
 {
+    // Re-entrancy guard: if a previous parallel run is still in flight (any bed from the current
+    // run is still slicing), ignore the click. Otherwise the loop below would call unique_ptr::reset()
+    // on a running BackgroundSlicingProcess; its destructor synchronously joins the worker thread,
+    // freezing the UI for the rest of that bed's slice. After all beds complete, re-clicking Slice
+    // all is the documented "re-slice changed beds" flow and proceeds normally.
+    for (int idx : m_current_run_beds) {
+        if (idx >= 0 && idx < (int)s_print_statuses.size() && s_print_statuses[idx] == PrintStatus::running)
+            return;
+    }
+
     background_process.stop();
+    m_parallel_autoslice_active = true;
+    m_parallel_run_cancel_count = 0;
+    m_parallel_run_error_count  = 0;
+    m_parallel_run_template_warning_pushed = false;
 
     const int n_beds = s_multiple_beds.get_number_of_beds();
     // Don't clear m_autoslice_processes wholesale — we want to PRESERVE processes (and their
@@ -7566,6 +7678,14 @@ const DynamicPrintConfig * Plater::config() const { return p->config; }
 
 bool Plater::set_printer_technology(PrinterTechnology printer_technology)
 {
+    // Drain any parallel autoslice workers BEFORE flipping the technology. on_config_change
+    // reaches this from project load / profile import / vendor switch — paths distinct from
+    // the sidebar preset combobox (which already drains in Sidebar::on_select_preset). Without
+    // this, FFF parallel workers keep slicing fff_prints[i] while the plater believes it's now
+    // in SLA mode, and their completion events overwrite s_print_statuses.
+    if (s_multiple_beds.is_autoslicing())
+        this->leave_autoslice_mode(false);
+
     p->printer_technology = printer_technology;
     bool ret = p->background_process.select_technology(printer_technology);
     if (ret) {
@@ -7758,6 +7878,20 @@ void Plater::cancel_parallel_autoslice()
         }
     }
     p->m_current_run_beds.clear();
+    p->m_parallel_autoslice_active = false;
+}
+bool Plater::is_parallel_autoslicing() const { return p->is_parallel_autoslicing(); }
+
+void Plater::leave_autoslice_mode(bool user_initiated)
+{
+    // Order matters: drain any parallel workers BEFORE clearing the autoslicing flag, so
+    // completion events from those workers route through the parallel branch (which checks
+    // m_autoslice_processes[bed_idx]) rather than the single-bed branch. Reversing the order
+    // can drop events on the floor or — worse, with the bed_idx<0 sentinel guard removed —
+    // corrupt s_print_statuses for whatever bed is currently active.
+    cancel_parallel_autoslice();
+    s_multiple_beds.stop_autoslice(user_initiated);
+    p->sidebar->switch_from_autoslicing_mode();
 }
 
 void Plater::copy_selection_to_clipboard()

@@ -963,9 +963,7 @@ void Sidebar::on_select_preset(wxCommandEvent& evt)
          * and for SLA presets they should be deleted
          */
         m_object_list->update_object_list_by_printer_technology();
-        this->m_plater->cancel_parallel_autoslice(); // must drain threads before clearing flag
-        s_multiple_beds.stop_autoslice(false);
-        this->switch_from_autoslicing_mode();
+        this->m_plater->leave_autoslice_mode(false);
         wxQueueEvent(this->m_plater, new SimpleEvent(EVT_REGENERATE_BED_THUMBNAILS));
         this->m_plater->update();
         s_print_statuses.fill(PrintStatus::idle);
