@@ -3968,6 +3968,17 @@ void Plater::priv::init_notification_manager()
     notification_manager->init();
 
     auto cancel_callback = [this]() {
+        // If a "Slice all" run is active, the X means "cancel the whole run", not just the
+        // currently-running bed. Without this, sequential autoslice re-triggers the same bed
+        // immediately: the render loop sees the cancelled bed's status flip to idle and calls
+        // schedule_background_process, which restarts slicing on the next frame.
+        if (s_multiple_beds.is_autoslicing()) {
+            s_multiple_beds.stop_autoslice(true);
+            sidebar->switch_from_autoslicing_mode();
+            if (! this->background_process.idle())
+                this->background_process.stop();
+            return true;
+        }
         if (this->background_process.idle())
             return false;
         this->background_process.stop();
