@@ -35,9 +35,11 @@
 #include "Selection.hpp"
 #include "format.hpp"
 #include "NotificationManager.hpp"
+#include "ExtraRenderers.hpp"
 #include "MsgDialog.hpp"
 
 #include <boost/algorithm/string.hpp>
+#include <map>
 #include <wx/progdlg.h>
 #include <wx/listbook.h>
 #include <wx/numformatter.h>
@@ -357,8 +359,8 @@ void ObjectList::create_objects_ctrl()
         colName, 20*em, wxALIGN_LEFT, wxDATAVIEW_COL_RESIZABLE));
 
     // column PrintableProperty (Icon) of the view control:
-    AppendBitmapColumn(" ", colPrint, wxDATAVIEW_CELL_INERT, 3*em,
-        wxALIGN_CENTER_HORIZONTAL, wxDATAVIEW_COL_RESIZABLE);
+    AppendColumn(new wxDataViewColumn(" ", new BitmapIconRenderer(wxDATAVIEW_CELL_INERT, wxALIGN_CENTER_HORIZONTAL | wxALIGN_CENTER_VERTICAL),
+        colPrint, 3*em, wxALIGN_CENTER_HORIZONTAL, wxDATAVIEW_COL_RESIZABLE));
 
     // column Extruder of the view control:
     BitmapChoiceRenderer* bmp_choice_renderer = new BitmapChoiceRenderer();
@@ -372,8 +374,8 @@ void ObjectList::create_objects_ctrl()
         colExtruder, 8*em, wxALIGN_CENTER_HORIZONTAL, wxDATAVIEW_COL_RESIZABLE));
 
     // column ItemEditing of the view control:
-    AppendBitmapColumn(_L("Editing"), colEditing, wxDATAVIEW_CELL_INERT, 3*em,
-        wxALIGN_CENTER_HORIZONTAL, wxDATAVIEW_COL_RESIZABLE);
+    AppendColumn(new wxDataViewColumn(_L("Editing"), new BitmapIconRenderer(wxDATAVIEW_CELL_INERT, wxALIGN_CENTER_HORIZONTAL | wxALIGN_CENTER_VERTICAL),
+        colEditing, 3*em, wxALIGN_CENTER_HORIZONTAL, wxDATAVIEW_COL_RESIZABLE));
 
     // For some reason under OSX on 4K(5K) monitors in wxDataViewColumn constructor doesn't set width of column.
     // Therefore, force set column width.
