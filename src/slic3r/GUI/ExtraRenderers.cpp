@@ -10,7 +10,10 @@
 #include "BitmapComboBox.hpp"
 #include "Plater.hpp"
 
+#include <boost/functional/hash.hpp>
+
 #include <wx/dc.h>
+#include <wx/dcmemory.h>
 #ifdef wxHAS_GENERIC_DATAVIEWCTRL
 #include "wx/generic/private/markuptext.h"
 #include "wx/generic/private/rowheightcache.h"
@@ -439,4 +442,100 @@ wxSize TextRenderer::GetSize() const
     return GetTextExtent(m_value);
 }
 
+
+// ----------------------------------------------------------------------------
+// BitmapIconRenderer
+// ----------------------------------------------------------------------------
+
+std::map<std::pair<wxUint64, wxUint32>, wxBitmap> BitmapIconRenderer::s_cache;
+
+wxUint64 BitmapIconRenderer::fingerprint(const wxBitmap& src)
+{
+    const wxImage img = src.ConvertToImage();
+    const int w = img.GetWidth(), ht = img.GetHeight();
+    size_t h = 0;
+    boost::hash_combine(h, w);
+    boost::hash_combine(h, ht);
+    const size_t npixels = size_t(w) * ht;
+    if (const unsigned char* d = img.GetData())
+        boost::hash_range(h, d, d + npixels * 3);
+    if (img.HasAlpha()) {
+        const unsigned char* a = img.GetAlpha();
+        boost::hash_range(h, a, a + npixels);
+    }
+    return static_cast<wxUint64>(h);
+}
+
+const wxBitmap* BitmapIconRenderer::find_composited(wxUint64 fp, wxUint32 rgb)
+{
+    auto it = s_cache.find({fp, rgb});
+    return it != s_cache.end() ? &it->second : nullptr;
+}
+
+wxBitmap BitmapIconRenderer::make_composited(wxUint64 fp, const wxBitmap& src, const wxColour& bg)
+{
+    if (s_cache.size() > 1024) s_cache.clear();
+    wxBitmap out(src.GetWidth(), src.GetHeight(), 24);
+    {
+        wxMemoryDC mdc(out);
+        mdc.SetBackground(wxBrush(bg));
+        mdc.Clear();
+        mdc.DrawBitmap(src, 0, 0, true);
+    }
+    return s_cache.emplace(std::make_pair(fp, bg.GetRGB()), std::move(out)).first->second;
+}
+
+bool BitmapIconRenderer::SetValue(const wxVariant& value)
+{
+    wxBitmap src;
+    if (value.GetType() == wxS("wxBitmap"))
+        src << value;
+    if (!src.IsOk()) { m_src = m_normal = wxNullBitmap; m_fp = 0; return true; }
+    m_fp  = fingerprint(src);
+    m_src = src;
+    const wxColour bg = GetView()->GetBackgroundColour();
+    if (const wxBitmap* b = find_composited(m_fp, bg.GetRGB()))
+        m_normal = *b;
+    else
+        m_normal = make_composited(m_fp, src, bg);
+    return true;
+}
+
+wxSize BitmapIconRenderer::GetSize() const
+{
+    if (m_normal.IsOk())
+        return m_normal.GetSize();
+    const int s = Slic3r::GUI::wxGetApp().em_unit();
+    return wxSize(s, s);
+}
+
+bool BitmapIconRenderer::Render(wxRect cell, wxDC* dc, int state)
+{
+    if (!m_normal.IsOk())
+        return true;
+
+    wxBitmap bmp = m_normal;
+    if ((state & wxDATAVIEW_CELL_SELECTED) && m_src.IsOk()) {
+        // Selected rows sit on a theme-drawn background whose colour varies per row
+        // (plain selection vs the brighter focused/active row) and isn't conveyed
+        // by the render-state flags. So read this cell's actual background -- the
+        // control paints it before the cell renders -- and composite onto it. The
+        // composite is cached by fingerprint+colour, so the per-cell cost is just
+        // the GetPixel + a cache hit, and only a couple of distinct colours arise.
+        wxColour bg;
+        if (dc->GetPixel(cell.x + 1, cell.y + cell.height / 2, &bg)) {
+            if (const wxBitmap* b = find_composited(m_fp, bg.GetRGB()))
+                bmp = *b;
+            else
+                bmp = make_composited(m_fp, m_src, bg);
+        } else {
+            bmp = m_src; // fallback: original alpha icon (correct, just slower)
+        }
+    }
+
+    const wxSize sz = bmp.GetSize();
+    dc->DrawBitmap(bmp, cell.x + (cell.width - sz.x) / 2,
+                        cell.y + (cell.height - sz.y) / 2, false);
+    return true;
+}
 

@@ -6,6 +6,7 @@
 #define slic3r_GUI_ExtraRenderers_hpp_
 
 #include <functional>
+#include <map>
 
 #include <wx/dataview.h>
 
@@ -187,6 +188,44 @@ public:
 
 private:
     wxString    m_value;
+};
+
+
+
+// ----------------------------------------------------------------------------
+// BitmapIconRenderer
+// ----------------------------------------------------------------------------
+
+// Icon renderer for the Print/Editing columns. Drawing a 32-bit alpha wxBitmap
+// onto the object list's buffered paint DC costs ~330us/cell on wxMSW (live
+// AlphaBlend), so scrolling a long list with these icon columns crawls
+// (GH #15177, #11557). This renderer pays that cost once per distinct icon by
+// pre-compositing it onto the row background -- an opaque bitmap that then blits in
+// ~10us. Selected rows are composited onto the theme's selection colour (read from
+// the painted DC, per row so the active row matches too). Composites are cached by a
+// content fingerprint, which stays stable even when GetBitmapFor() hands back fresh
+// bitmaps at a second monitor's DPI (a pointer key would churn and grow the cache
+// without bound -> OOM).
+class BitmapIconRenderer : public wxDataViewCustomRenderer
+{
+    wxBitmap m_src;    // the original alpha icon (fallback + cache-miss blend source)
+    wxBitmap m_normal; // m_src pre-composited onto the current normal row background
+    wxUint64 m_fp = 0; // content fingerprint of m_src (cache key)
+
+    static std::map<std::pair<wxUint64, wxUint32>, wxBitmap> s_cache;
+
+    static wxUint64       fingerprint(const wxBitmap& src);
+    static const wxBitmap* find_composited(wxUint64 fp, wxUint32 rgb);
+    static wxBitmap        make_composited(wxUint64 fp, const wxBitmap& src, const wxColour& bg);
+
+public:
+    BitmapIconRenderer(wxDataViewCellMode mode, int align)
+        : wxDataViewCustomRenderer(wxS("wxBitmap"), mode, align) {}
+
+    bool SetValue(const wxVariant& value) override;
+    bool GetValue(wxVariant& WXUNUSED(value)) const override { return true; }
+    wxSize GetSize() const override;
+    bool Render(wxRect cell, wxDC* dc, int state) override;
 };
 
 
